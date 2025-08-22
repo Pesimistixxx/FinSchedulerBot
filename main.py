@@ -1,10 +1,10 @@
 import datetime
 import os
-from collections import defaultdict
-
 import telebot
 import requests
 import re
+
+from collections import defaultdict
 from dotenv import load_dotenv
 from telebot import custom_filters, types
 from telebot.storage import StateMemoryStorage
@@ -29,10 +29,30 @@ bot = telebot.TeleBot(BOT_TOKEN, state_storage=state_storage)
 bot.set_my_commands([
     telebot.types.BotCommand("/start", "Запустить бота"),
     telebot.types.BotCommand("/menu", "Главное меню"),
-    telebot.types.BotCommand("/schedule", "Показать расписание"),
+    telebot.types.BotCommand("/login", "Войти в аккаунт"),
+    telebot.types.BotCommand("/logout", "Выйти из аккаунта"),
+    telebot.types.BotCommand("/schedule_group", "Показать расписание группы"),
+    telebot.types.BotCommand("/schedule_teacher", "Показать расписание преподавателя"),
     telebot.types.BotCommand("/disciplines", "Список баллов и посещений"),
-    telebot.types.BotCommand("/logout", "Выйти из аккаунта")
 ])
+
+
+class Cache:
+    def __init__(self, ttl=300):
+        self.ttl = ttl
+        self.cache = {}
+
+    def get(self, key):
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if datetime.datetime.now() - timestamp < datetime.timedelta(seconds=self.ttl):
+                return value
+            else:
+                del self.cache[key]
+        return None
+
+    def set(self, key, value):
+        self.cache[key] = (value, datetime.datetime.now())
 
 
 class UserStates(StatesGroup):
@@ -40,7 +60,11 @@ class UserStates(StatesGroup):
     waiting_password = State()
     waiting_code = State()
     waiting_group = State()
+    waiting_teacher = State()
     final = State()
+
+
+schedule_cache = Cache(ttl=3600)
 
 
 def get_user_session(user_id, chat_id):
@@ -151,7 +175,8 @@ def login_account(message, user_login, user_password):
             "USER_PASSWORD": user_password
         },
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Referer": LOGIN_URL,
             "Content-Type": "application/x-www-form-urlencoded"
         },
@@ -295,12 +320,29 @@ def get_week_dates(offset=0):
 
 
 def show_schedule(bot, chat_id, offset=0, message_id=None):
-    start_date, end_date = get_week_dates(offset)
-
     with bot.retrieve_data(chat_id, chat_id) as data:
         group_id = data['group_id']
         user_session = data.get('session', requests.Session())
         previous_messages_ids = data.get('last_schedule_messages', [])
+
+    cache_key = f"{group_id}_{offset}"
+    cached_data = schedule_cache.get(cache_key)
+    start_date, end_date = get_week_dates(offset)
+
+    if cached_data:
+        final_message, markup = cached_data
+        new_message_ids = send_long_message(
+            bot=bot,
+            chat_id=chat_id,
+            text=final_message,
+            parse_mode='HTML',
+            reply_markup=markup,
+            message_id=message_id,
+            prev_messages_id=previous_messages_ids
+        )
+        with bot.retrieve_data(chat_id, chat_id) as data:
+            data['last_schedule_messages'] = new_message_ids[1:]
+        return
 
     response = user_session.post(
         url=f'{SCHEDULE_URL}/{group_id}',
@@ -310,7 +352,8 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
             "lng": 1,
         },
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Referer": SCHEDULE_URL,
             "Content-Type": "application/x-www-form-urlencoded"
         },
@@ -318,8 +361,10 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
     )
     markup = create_schedule_keyboard(offset)
     schedule_data = response.json()
+
     if not schedule_data:
-        text = f"Расписание на неделю ({get_current_monday() + datetime.timedelta(weeks=offset)} - {get_current_monday() + datetime.timedelta(weeks=(1 + offset))}) отсутсвует",
+        text = (f"Расписание на неделю ({get_current_monday() + datetime.timedelta(weeks=offset)}"
+                f" - {get_current_monday() + datetime.timedelta(weeks=(1 + offset))}) отсутсвует"),
         if message_id:
             try:
                 bot.edit_message_text(chat_id=chat_id,
@@ -346,7 +391,8 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
                 'kind_of_work': lesson['kindOfWork'],
                 'lecturer': lesson['lecturer'],
                 'begin': lesson['beginLesson'],
-                'end': lesson['endLesson']
+                'end': lesson['endLesson'],
+                'auditorium': lesson['auditorium']
             })
         full_schedule_text = ""
         for date, lessons in sorted(lessons_by_date.items()):
@@ -354,8 +400,9 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
             for i, lesson in enumerate(lessons, 1):
                 full_schedule_text += (
                     f"{i}. {lesson['discipline']} - {lesson['kind_of_work']}\n"
-                    f"   👤 Преподаватель: {lesson['lecturer']}\n"
-                    f"   ⏰ Время: {lesson['begin']} - {lesson['end']}\n\n"
+                    f"👤 Преподаватель: {lesson['lecturer']}\n"
+                    f"⏰ Время: {lesson['begin']} - {lesson['end']}\n"
+                    f"🚪 Аудитория {lesson['auditorium']}\n\n"
                 )
         header = f"<b>Расписание на неделю ({start_date} - {end_date})</b>\n"
         final_message = header + full_schedule_text
@@ -370,15 +417,33 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
             prev_messages_id=previous_messages_ids
         )
         with bot.retrieve_data(chat_id, chat_id) as data:
-            data['last_schedule_messages'] = new_message_ids
+            data['last_schedule_messages'] = new_message_ids[1:]
+        schedule_cache.set(cache_key, (final_message, markup))
 
 
 def show_discipline_info(bot, chat_id, discipline_id, offset=0, message_id=None):
     start_date, end_date, quarter = current_quarter(offset)
+    cache_key = f"{chat_id}_{discipline_id}_{offset}"
+    cached_data = schedule_cache.get(cache_key)
 
     with bot.retrieve_data(chat_id, chat_id) as data:
         user_session = data.get('session', requests.Session())
-        previous_message_ids = data.get('last_discipline_messages', [])
+        previous_messages_ids = data.get('last_discipline_messages', [])
+
+    if cached_data:
+        final_message, markup = cached_data
+        new_message_ids = send_long_message(
+            bot=bot,
+            chat_id=chat_id,
+            text=final_message,
+            parse_mode='HTML',
+            reply_markup=markup,
+            message_id=message_id,
+            prev_messages_id=previous_messages_ids
+        )
+        with bot.retrieve_data(chat_id, chat_id) as data:
+            data['last_schedule_messages'] = new_message_ids[1:]
+        return
 
     profile_response = user_session.get(url=PROFILE_URL)
     student_id = profile_response.json()[0]['id']
@@ -391,7 +456,9 @@ def show_discipline_info(bot, chat_id, discipline_id, offset=0, message_id=None)
                                      'student_id': student_id
                                  },
                                  headers={
-                                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                                   "Chrome/125.0.0.0 Safari/537.36",
                                      "Referer": DISCIPLINE_URL,
                                      "Content-Type": "application/x-www-form-urlencoded"
                                  },
@@ -471,11 +538,11 @@ def show_discipline_info(bot, chat_id, discipline_id, offset=0, message_id=None)
     attended = sum(1 for lesson in lessons_info.values() if
                    (lesson.get('visit_status') == 2 or lesson.get('visit_status') is None))
     attendance_percent = (attended / total_lessons * 100) if total_lessons > 0 else 0
-
+    header = f"Посещения и баллы за {quarter} ТКУ (Текущий контроль успеваемости)\n"
     footer = (f"📊Всего занятий: {total_lessons}\n"
               f"❌Отсутствовал: {total_lessons - attended}\n"
               f"📈Процент посещаемости: {attendance_percent:.1f}%\n"
-              f"⭐Общая сумма баллов: {float(student_data.get('mark_sum', 0)):.1f}\n\n")
+              f"⭐Общая сумма баллов за ТКУ: {float(student_data.get('mark_sum', 0)):.1f}\n\n")
 
     lessons_text = ""
     for lesson in discipline_data['lessons']:
@@ -498,40 +565,74 @@ def show_discipline_info(bot, chat_id, discipline_id, offset=0, message_id=None)
         total_mark = lesson_data.get('total_mark', 0)
         mark_text = f"{total_mark:.1f}" if isinstance(total_mark, (int, float)) else "0.0"
 
-        lessons_text += (f"📅Дата и время: {time_range}\n"
-                         f"📚Тип: {lesson.get('kind_of_work', 'Тип недоступен')}\n"
-                         f"👤Преподаватель: {lesson.get('profile_fio', 'Неизвестен')}\n"
-                         f"👣Статус посещения: {status}\n"
-                         f"⭐Сумма баллов: {mark_text}\n"
+        lessons_text += (f"📅 Дата и время: {time_range}\n"
+                         f"📚 Тип: {lesson.get('kind_of_work', 'Тип недоступен')}\n"
+                         f"👤 Преподаватель: {lesson.get('profile_fio', 'Неизвестен')}\n"
+                         f"👣 Статус посещения: {status}\n"
+                         f"⭐ Баллы за занятие: {mark_text}\n"
                          f"{'-' * 40}\n")
 
-    full_text = lessons_text + footer
+    final_message = header + lessons_text + footer
     new_message_ids = send_long_message(
         bot=bot,
         chat_id=chat_id,
-        text=full_text,
+        text=final_message,
         parse_mode='HTML',
         reply_markup=markup,
         message_id=message_id,
-        prev_messages_id=previous_message_ids
+        prev_messages_id=previous_messages_ids
     )
-
+    schedule_cache.set(cache_key, (final_message, markup))
     with bot.retrieve_data(chat_id, chat_id) as data:
-        data['last_discipline_messages'] = new_message_ids
+        data['last_discipline_messages'] = new_message_ids[1:]
 
 
-@bot.message_handler(commands=['start', 'menu', 'cancel'], state='*')
+@bot.message_handler(commands=['start', 'menu', 'cancel', 'disciplines', 'schedule', 'login'], state='*')
 def handle_commands_anywhere(message):
     if message.text == '/start':
         start(message)
+    elif message.text == '/start':
+        login(message)
     elif message.text == '/menu':
         menu(message)
+    elif message.text == '/login':
+        login(message)
+    elif message.text in ['Баллы и посещения', '/disciplines']:
+        handle_disciplines_list(message)
+    elif message.text in ['Расписание группы', '/schedule_group']:
+        bot.set_state(message.from_user.id, UserStates.waiting_group, message.chat.id)
+        handle_group_choose(message)
+    elif message.text in ['Расписание преподавателя', '/schedule_teacher']:
+        bot.set_state(message.from_user.id, UserStates.waiting_teacher, message.chat.id)
+        handle_group_choose(message)
     elif message.text == '/cancel':
         bot.send_message(message.chat.id, "Текущее действие отменено.")
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if check_authorization(message.from_user.id, message.chat.id):
+        markup.add(
+            types.KeyboardButton('Расписание группы'),
+            types.KeyboardButton('Баллы и посещения')
+        )
+    else:
+        markup.add(
+            types.KeyboardButton('Расписание группы'),
+            types.KeyboardButton('Войти в аккаунт'),
+        )
+    bot.send_message(message.from_user.id, ('Добро пожаловать в FinBot\n'
+                                            'Функционал Бота:\n'
+                                            '1. Посмотреть Расписание\n'
+                                            '2. Посмотреть Расписание преподавателя\n'
+                                            '3. Посмотреть свои баллы(нужно войти в аккаунт)\n\n'
+                                            'Выбери что ты хочешь сделать'),
+                     reply_markup=markup)
+
+
+@bot.message_handler(func=lambda message: message.text.lower() in ['/login', 'войти в аккаунт'])
+def login(message):
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         user_login = data.get('user_login')
         user_password = data.get('user_password')
@@ -604,7 +705,8 @@ def process_code(message):
                 "sessid": session_id
             },
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Referer": LOGIN_URL,
                 "Content-Type": "application/x-www-form-urlencoded"
             },
@@ -625,54 +727,82 @@ def menu(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if check_authorization(message.from_user.id, message.chat.id):
         markup.add(
-            types.KeyboardButton('Расписание'),
+            types.KeyboardButton('Расписание группы'),
+            types.KeyboardButton('Расписание преподавателя'),
             types.KeyboardButton('Баллы и посещения')
         )
     else:
         markup.add(
-            types.KeyboardButton('Расписание'),
+            types.KeyboardButton('Расписание группы'),
+            types.KeyboardButton('Расписание преподавателя'),
+            types.KeyboardButton('Войти в аккаунт'),
         )
     bot.send_message(message.from_user.id,
                      'Выбери что ты хочешь сделать',
                      reply_markup=markup)
 
 
-@bot.message_handler(func=lambda message: message.text.lower() == 'расписание'
-                     or message.text == '/schedule')
+@bot.message_handler(func=lambda message: message.text.lower() == 'расписание группы'
+                     or message.text == '/schedule_group')
 def handle_group_choose(message):
     markup = types.ReplyKeyboardRemove()
     bot.send_message(message.chat.id, 'Введите название группы', reply_markup=markup)
     bot.set_state(message.from_user.id, UserStates.waiting_group, message.chat.id)
 
 
-@bot.message_handler(state=UserStates.waiting_group)
+@bot.message_handler(func=lambda message: message.text.lower() == 'расписание преподавателя'
+                     or message.text == '/schedule_teacher')
+def handle_teacher_choose(message):
+    markup = types.ReplyKeyboardRemove()
+    bot.send_message(message.chat.id, 'Введите ФИО преподаваетля', reply_markup=markup)
+    bot.set_state(message.from_user.id, UserStates.waiting_teacher, message.chat.id)
+
+
+@bot.message_handler(state=[UserStates.waiting_group, UserStates.waiting_teacher])
 def process_group_input(message):
     if message.text in ['Баллы и посещения', '/disciplines']:
         bot.set_state(message.from_user.id, UserStates.final, message.chat.id)
         handle_disciplines_list(message)
         return
-
     user_session = get_user_session(message.from_user.id, message.chat.id)
-    group_response = user_session.get(url=SEARCH_URL,
-                                      params={
-                                          'type': 'group',
-                                          'term': message.text
-                                      })
-    groups_data = group_response.json()
-    if not groups_data:
-        bot.send_message(message.from_user.id,
-                         text='Группа не найдена, попробуй ввести снова')
+    state = bot.get_state(user_id=message.from_user.id, chat_id=message.chat.id)
+
+    if state == 'UserStates:waiting_teacher':
+        teacher_response = user_session.get(url=SEARCH_URL,
+                                            params={
+                                                'type': 'person',
+                                                'term': message.text
+                                        })
+        schedule_data = teacher_response.json()
+    else:
+        group_response = user_session.get(url=SEARCH_URL,
+                                          params={
+                                              'type': 'group',
+                                              'term': message.text
+                                          })
+        schedule_data = group_response.json()
+    if not schedule_data:
+        if state == 'UserStates:waiting_teacher':
+            bot.send_message(message.from_user.id,
+                             text='Преподаватель не найден, попробуй ввести снова')
+        else:
+            bot.send_message(message.from_user.id,
+                             text='Группа не найдена, попробуй ввести снова')
         return
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['group_id'] = group_response.json()[0]['id']
+        data['group_id'] = schedule_data[0]['id']
     markup = types.InlineKeyboardMarkup(row_width=2)
     yes_btn = types.InlineKeyboardButton('Да, верно', callback_data="schedule_0")
     no_btn = types.InlineKeyboardButton('Нет, выбрать заново', callback_data="group_incorrect")
     markup.add(yes_btn, no_btn)
-    bot.send_message(message.from_user.id,
-                     text=f'Твоя группа это {group_response.json()[0]['label']}, верно?',
-                     reply_markup=markup)
-    bot.set_state(message.from_user.id, UserStates.waiting_group, message.chat.id)
+    if UserStates.waiting_group:
+        bot.send_message(message.from_user.id,
+                         text=f'Твоя группа это {schedule_data[0]['label']}, верно?',
+                         reply_markup=markup)
+    elif UserStates.waiting_teacher:
+        bot.send_message(message.from_user.id,
+                         text=f'Ты хочешь посмотреть расписание {schedule_data[0]['label']}, верно?',
+                         reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "group_incorrect")
@@ -706,24 +836,43 @@ def handle_schedule_navigation(call):
 
 @bot.message_handler(commands=['logout'])
 def logout(message):
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data.clear()
+    if check_authorization(message.from_user.id, message.chat.id):
+        with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+            data.clear()
+        bot.send_message(message.from_user.id, 'Вы успешно вышли из аккаунта')
+    bot.send_message(message.from_user.id, 'Вы и так не авторизованы')
 
 
 @bot.message_handler(func=lambda message: message.text.lower() == 'баллы и посещения'
                      or message.text == '/disciplines')
 def handle_disciplines_list(message):
     if not check_authorization(message.from_user.id, message.chat.id):
-        bot.send_message(message.from_user.id, 'Сессия истекла, введи свои данные заново с помощью команды /start')
+        bot.send_message(message.from_user.id, 'Для этой функции нужно войти в аккаунт с помощью команды /login')
         return
+
     remove_msg = bot.send_message(
         chat_id=message.chat.id,
         text="Ожидайте, происходит загрузка",
         reply_markup=types.ReplyKeyboardRemove())
+
     user_session = get_user_session(message.from_user.id, message.chat.id)
     profile_response = user_session.get(url=PROFILE_URL)
     student_id = profile_response.json()[0]['id']
     start_date, end_date = get_current_semester()
+    cache_key = f"{student_id}_{message.chat.id}"
+    cached_data = schedule_cache.get(cache_key)
+
+    if cached_data:
+        final_text, markup = cached_data
+        bot.send_message(
+            chat_id=message.chat.id,
+            text=final_text,
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        bot.delete_message(message.chat.id, remove_msg.message_id)
+        return
+
     disciplines_response = user_session.post(url=DISCIPLINES_LIST_URL,
                                              json={
                                                  "date_from": start_date,
@@ -731,7 +880,9 @@ def handle_disciplines_list(message):
                                                  "student_id": student_id
                                              },
                                              headers={
-                                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                                               "Chrome/125.0.0.0 Safari/537.36",
                                                  "Referer": DISCIPLINES_LIST_URL,
                                                  "Content-Type": "application/x-www-form-urlencoded"
                                              },
@@ -778,6 +929,7 @@ def handle_disciplines_list(message):
         reply_markup=markup
     )
     bot.delete_message(message.chat.id, remove_msg.message_id)
+    schedule_cache.set(cache_key, (final_text, markup))
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('discipline_'))
