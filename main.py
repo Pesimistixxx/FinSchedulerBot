@@ -1,4 +1,5 @@
 import datetime
+import functools
 import os
 import telebot
 import requests
@@ -7,8 +8,10 @@ import re
 from collections import defaultdict
 from dotenv import load_dotenv
 from telebot import custom_filters, types
+from telebot.types import BotCommandScopeDefault, BotCommandScopeChat
 from telebot.storage import StateMemoryStorage
 from telebot.handler_backends import StatesGroup, State
+from concurrent.futures import ThreadPoolExecutor
 
 from otp_sum_checker import otpchksum
 
@@ -26,15 +29,19 @@ state_storage = StateMemoryStorage()
 
 bot = telebot.TeleBot(BOT_TOKEN, state_storage=state_storage)
 
-bot.set_my_commands([
+not_auth_commands = [
     telebot.types.BotCommand("/start", "Запустить бота"),
     telebot.types.BotCommand("/menu", "Главное меню"),
     telebot.types.BotCommand("/login", "Войти в аккаунт"),
-    telebot.types.BotCommand("/logout", "Выйти из аккаунта"),
     telebot.types.BotCommand("/schedule_group", "Показать расписание группы"),
     telebot.types.BotCommand("/schedule_teacher", "Показать расписание преподавателя"),
     telebot.types.BotCommand("/disciplines", "Список баллов и посещений"),
-])
+]
+
+bot.set_my_commands(
+        not_auth_commands,
+        scope=BotCommandScopeDefault()
+    )
 
 
 class Cache:
@@ -65,6 +72,15 @@ class UserStates(StatesGroup):
 
 
 schedule_cache = Cache(ttl=3600)
+
+executor = ThreadPoolExecutor(max_workers=5)
+
+
+def async_task(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return executor.submit(func, *args, **kwargs)
+    return wrapper
 
 
 def get_user_session(user_id, chat_id):
@@ -99,7 +115,23 @@ def check_authorization(user_id, chat_id):
     pattern = r"<title>Unauthorized</title>"
     if re.findall(pattern, response.text):
         return False
+    update_menu_buttons(user_id)
     return True
+
+
+def update_menu_buttons(user_id):
+    auth_commands = [
+        telebot.types.BotCommand("/start", "Запустить бота"),
+        telebot.types.BotCommand("/menu", "Главное меню"),
+        telebot.types.BotCommand("/logout", "Выйти из аккаунта"),
+        telebot.types.BotCommand("/schedule_group", "Показать расписание группы"),
+        telebot.types.BotCommand("/schedule_teacher", "Показать расписание преподавателя"),
+        telebot.types.BotCommand("/disciplines", "Список баллов и посещений"),
+    ]
+    bot.set_my_commands(
+        auth_commands,
+        scope=BotCommandScopeChat(user_id)
+    )
 
 
 def get_current_semester():
@@ -318,7 +350,7 @@ def get_week_dates(offset=0):
     sunday = monday + datetime.timedelta(days=6)
     return monday, sunday
 
-
+@async_task
 def show_schedule(bot, chat_id, offset=0, message_id=None):
     with bot.retrieve_data(chat_id, chat_id) as data:
         group_id = data['group_id']
@@ -420,7 +452,7 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
             data['last_schedule_messages'] = new_message_ids[1:]
         schedule_cache.set(cache_key, (final_message, markup))
 
-
+@async_task
 def show_discipline_info(bot, chat_id, discipline_id, offset=0, message_id=None):
     start_date, end_date, quarter = current_quarter(offset)
     cache_key = f"{chat_id}_{discipline_id}_{offset}"
@@ -839,10 +871,15 @@ def logout(message):
     if check_authorization(message.from_user.id, message.chat.id):
         with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
             data.clear()
+        bot.set_my_commands(
+            not_auth_commands,
+            scope=BotCommandScopeChat(message.from_user.id)
+        )
         bot.send_message(message.from_user.id, 'Вы успешно вышли из аккаунта')
-    bot.send_message(message.from_user.id, 'Вы и так не авторизованы')
+        return
+    bot.send_message(message.from_user.id, 'Вы не авторизованы')
 
-
+@async_task
 @bot.message_handler(func=lambda message: message.text.lower() == 'баллы и посещения'
                      or message.text == '/disciplines')
 def handle_disciplines_list(message):
