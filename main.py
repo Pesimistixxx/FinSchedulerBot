@@ -12,7 +12,6 @@ from telebot.types import BotCommandScopeDefault, BotCommandScopeChat
 from telebot.storage import StateMemoryStorage
 from telebot.handler_backends import StatesGroup, State
 from concurrent.futures import ThreadPoolExecutor
-
 from otp_sum_checker import otpchksum
 
 load_dotenv()
@@ -39,9 +38,9 @@ not_auth_commands = [
 ]
 
 bot.set_my_commands(
-        not_auth_commands,
-        scope=BotCommandScopeDefault()
-    )
+    not_auth_commands,
+    scope=BotCommandScopeDefault()
+)
 
 
 class Cache:
@@ -80,6 +79,7 @@ def async_task(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         return executor.submit(func, *args, **kwargs)
+
     return wrapper
 
 
@@ -350,6 +350,7 @@ def get_week_dates(offset=0):
     sunday = monday + datetime.timedelta(days=6)
     return monday, sunday
 
+
 @async_task
 def show_schedule(bot, chat_id, offset=0, message_id=None):
     with bot.retrieve_data(chat_id, chat_id) as data:
@@ -451,6 +452,7 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
         with bot.retrieve_data(chat_id, chat_id) as data:
             data['last_schedule_messages'] = new_message_ids[1:]
         schedule_cache.set(cache_key, (final_message, markup))
+
 
 @async_task
 def show_discipline_info(bot, chat_id, discipline_id, offset=0, message_id=None):
@@ -804,7 +806,7 @@ def process_group_input(message):
                                             params={
                                                 'type': 'person',
                                                 'term': message.text
-                                        })
+                                            })
         schedule_data = teacher_response.json()
     else:
         group_response = user_session.get(url=SEARCH_URL,
@@ -825,13 +827,15 @@ def process_group_input(message):
         data['group_id'] = schedule_data[0]['id']
     markup = types.InlineKeyboardMarkup(row_width=2)
     yes_btn = types.InlineKeyboardButton('Да, верно', callback_data="schedule_0")
-    no_btn = types.InlineKeyboardButton('Нет, выбрать заново', callback_data="group_incorrect")
-    markup.add(yes_btn, no_btn)
-    if UserStates.waiting_group:
+    if state == 'UserStates:waiting_group':
+        no_btn = types.InlineKeyboardButton('Нет, выбрать заново', callback_data="group_incorrect")
+        markup.add(yes_btn, no_btn)
         bot.send_message(message.from_user.id,
                          text=f'Твоя группа это {schedule_data[0]['label']}, верно?',
                          reply_markup=markup)
-    elif UserStates.waiting_teacher:
+    elif state == 'UserStates:waiting_teacher':
+        no_btn = types.InlineKeyboardButton('Нет, выбрать заново', callback_data="teacher_incorrect")
+        markup.add(yes_btn, no_btn)
         bot.send_message(message.from_user.id,
                          text=f'Ты хочешь посмотреть расписание {schedule_data[0]['label']}, верно?',
                          reply_markup=markup)
@@ -843,6 +847,14 @@ def handle_group_incorrect(call):
 
     bot.send_message(call.message.chat.id, 'Пожалуйста, введите название группы ещё раз')
     bot.set_state(call.from_user.id, UserStates.waiting_group, call.message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "teacher_incorrect")
+def handle_group_incorrect(call):
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+
+    bot.send_message(call.message.chat.id, 'Пожалуйста, введите ФИО преподавателя ещё раз')
+    bot.set_state(call.from_user.id, UserStates.waiting_teacher, call.message.chat.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('schedule_'))
@@ -878,6 +890,7 @@ def logout(message):
         bot.send_message(message.from_user.id, 'Вы успешно вышли из аккаунта')
         return
     bot.send_message(message.from_user.id, 'Вы не авторизованы')
+
 
 @async_task
 @bot.message_handler(func=lambda message: message.text.lower() == 'баллы и посещения'
