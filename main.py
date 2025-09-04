@@ -18,11 +18,29 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 LOGIN_URL = "https://org.fa.ru/login/"
-SCHEDULE_URL = "https://org.fa.ru/ruzapi/schedule/group"
+SCHEDULE_GROUP_URL = "https://org.fa.ru/ruzapi/schedule/group"
+SCHEDULE_TEACHER_URL = "https://org.fa.ru/ruzapi/schedule/person"
 PROFILE_URL = "https://org.fa.ru/bitrix/vuz/api/profile/"
 DISCIPLINES_LIST_URL = "https://org.fa.ru/bitrix/vuz/api/atlog/get_journals_by_contingent"
 DISCIPLINE_URL = "https://org.fa.ru/bitrix/vuz/api/atlog/get_journal"
 SEARCH_URL = 'https://org.fa.ru/ruzapi/search'
+
+weekday_int_str = {1: 'Понедельник',
+                   2: 'Вторник',
+                   3: 'Среда',
+                   4: 'Четверг',
+                   5: 'Пятница',
+                   6: 'Суббота',
+                   7: 'Воскресенье'}
+
+time_begin_to_pair = {'8:30': 1,
+                      '10:10': 2,
+                      '11:50': 3,
+                      '14:00': 4,
+                      '15:40': 5,
+                      '17:20': 6,
+                      '18:55': 7,
+                      '20:30': 8}
 
 state_storage = StateMemoryStorage()
 
@@ -289,21 +307,41 @@ def send_long_message(bot, chat_id, text, parse_mode='HTML', reply_markup=None, 
     return sent_messages
 
 
-def create_schedule_keyboard(offset=0):
+def create_schedule_group_keyboard(offset=0):
     markup = types.InlineKeyboardMarkup(row_width=3)
 
     markup.add(
         types.InlineKeyboardButton(
             "⬅️",
-            callback_data=f'schedule_{offset - 1}'
+            callback_data=f'schedule_group_{offset - 1}'
         ),
         types.InlineKeyboardButton(
             "🔄",
-            callback_data=f'schedule_{offset}'
+            callback_data=f'schedule_group_{offset}'
         ),
         types.InlineKeyboardButton(
             "➡️",
-            callback_data=f'schedule_{offset + 1}'
+            callback_data=f'schedule_group_{offset + 1}'
+        )
+    )
+    return markup
+
+
+def create_schedule_teacher_keyboard(offset=0):
+    markup = types.InlineKeyboardMarkup(row_width=3)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "⬅️",
+            callback_data=f'schedule_teacher_{offset - 1}'
+        ),
+        types.InlineKeyboardButton(
+            "🔄",
+            callback_data=f'schedule_teacher_{offset}'
+        ),
+        types.InlineKeyboardButton(
+            "➡️",
+            callback_data=f'schedule_teacher_{offset + 1}'
         )
     )
     return markup
@@ -352,7 +390,7 @@ def get_week_dates(offset=0):
 
 
 @async_task
-def show_schedule(bot, chat_id, offset=0, message_id=None):
+def show_group_schedule(bot, chat_id, offset=0, message_id=None):
     with bot.retrieve_data(chat_id, chat_id) as data:
         group_id = data['group_id']
         user_session = data.get('session', requests.Session())
@@ -378,7 +416,7 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
         return
 
     response = user_session.post(
-        url=f'{SCHEDULE_URL}/{group_id}',
+        url=f'{SCHEDULE_GROUP_URL}/{group_id}',
         params={
             "start": start_date,
             "finish": end_date,
@@ -387,12 +425,12 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Referer": SCHEDULE_URL,
+            "Referer": SCHEDULE_GROUP_URL,
             "Content-Type": "application/x-www-form-urlencoded"
         },
         allow_redirects=True
     )
-    markup = create_schedule_keyboard(offset)
+    markup = create_schedule_group_keyboard(offset)
     schedule_data = response.json()
 
     if not schedule_data:
@@ -428,11 +466,111 @@ def show_schedule(bot, chat_id, offset=0, message_id=None):
                 'auditorium': lesson['auditorium']
             })
         full_schedule_text = ""
-        for date, lessons in sorted(lessons_by_date.items()):
-            full_schedule_text += f"\n📅 <b>Дата: {date}</b>\n\n"
+        for date, lessons in lessons_by_date.items():
+            full_schedule_text += f"\n📅 <b>Дата: {date} ({weekday_int_str[datetime.datetime.strptime(date, "%d.%m.%Y").isoweekday()]})</b>\n\n"
             for i, lesson in enumerate(lessons, 1):
                 full_schedule_text += (
-                    f"{i}. {lesson['discipline']} - {lesson['kind_of_work']}\n"
+                    f"{time_begin_to_pair.get(lesson['begin'], i)} пара: {lesson['discipline']} - {lesson['kind_of_work']}\n"
+                    f"👤 Преподаватель: {lesson['lecturer']}\n"
+                    f"⏰ Время: {lesson['begin']} - {lesson['end']}\n"
+                    f"🚪 Аудитория {lesson['auditorium']}\n\n"
+                )
+        header = f"<b>Расписание на неделю ({start_date} - {end_date})</b>\n"
+        final_message = header + full_schedule_text
+
+        new_message_ids = send_long_message(
+            bot=bot,
+            chat_id=chat_id,
+            text=final_message,
+            parse_mode='HTML',
+            reply_markup=markup,
+            message_id=message_id,
+            prev_messages_id=previous_messages_ids
+        )
+        with bot.retrieve_data(chat_id, chat_id) as data:
+            data['last_schedule_messages'] = new_message_ids[1:]
+        schedule_cache.set(cache_key, (final_message, markup))
+
+
+@async_task
+def show_teacher_schedule(bot, chat_id, offset=0, message_id=None):
+    with bot.retrieve_data(chat_id, chat_id) as data:
+        teacher_id = data['teacher_id']
+        user_session = data.get('session', requests.Session())
+        previous_messages_ids = data.get('last_schedule_messages', [])
+
+    cache_key = f"{teacher_id}_{offset}"
+    cached_data = schedule_cache.get(cache_key)
+    start_date, end_date = get_week_dates(offset)
+    if cached_data:
+        final_message, markup = cached_data
+        new_message_ids = send_long_message(
+            bot=bot,
+            chat_id=chat_id,
+            text=final_message,
+            parse_mode='HTML',
+            reply_markup=markup,
+            message_id=message_id,
+            prev_messages_id=previous_messages_ids
+        )
+        with bot.retrieve_data(chat_id, chat_id) as data:
+            data['last_schedule_messages'] = new_message_ids[1:]
+        return
+    response = user_session.post(
+        url=f'{SCHEDULE_TEACHER_URL}/{teacher_id}',
+        params={
+            "start": start_date,
+            "finish": end_date,
+            "lng": 1,
+        },
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Referer": SCHEDULE_TEACHER_URL,
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        allow_redirects=True
+    )
+    markup = create_schedule_teacher_keyboard(offset)
+    schedule_data = response.json()
+    if not schedule_data:
+        text = (f"Расписание на неделю ({get_current_monday() + datetime.timedelta(weeks=offset)}"
+                f" - {get_current_monday() + datetime.timedelta(weeks=(1 + offset))}) отсутсвует"),
+        if message_id:
+            try:
+                bot.edit_message_text(chat_id=chat_id,
+                                      message_id=message_id,
+                                      text=text,
+                                      parse_mode='HTML',
+                                      reply_markup=markup)
+            except telebot.apihelper.ApiTelegramException as e:
+                if "message is not modified" in str(e).lower():
+                    pass
+                else:
+                    raise e
+        else:
+            bot.send_message(chat_id=chat_id,
+                             text=text,
+                             parse_mode='HTML',
+                             reply_markup=markup)
+    else:
+        lessons_by_date = defaultdict(list)
+        for lesson in schedule_data:
+            formatted_date = format_date(lesson['date'])
+            lessons_by_date[formatted_date].append({
+                'discipline': lesson['discipline'],
+                'kind_of_work': lesson['kindOfWork'],
+                'lecturer': lesson['lecturer'],
+                'begin': lesson['beginLesson'],
+                'end': lesson['endLesson'],
+                'auditorium': lesson['auditorium']
+            })
+        full_schedule_text = ""
+        for date, lessons in lessons_by_date.items():
+            full_schedule_text += f"\n📅 <b>Дата: {date} ({weekday_int_str[datetime.datetime.strptime(date, "%d.%m.%Y").isoweekday()]})</b>\n\n"
+            for i, lesson in enumerate(lessons, 1):
+                full_schedule_text += (
+                    f"{time_begin_to_pair.get(lesson['begin'], i)} пара: {lesson['discipline']} - {lesson['kind_of_work']}\n"
                     f"👤 Преподаватель: {lesson['lecturer']}\n"
                     f"⏰ Время: {lesson['begin']} - {lesson['end']}\n"
                     f"🚪 Аудитория {lesson['auditorium']}\n\n"
@@ -654,6 +792,7 @@ def start(message):
     else:
         markup.add(
             types.KeyboardButton('Расписание группы'),
+            types.KeyboardButton('Расписание преподавателя'),
             types.KeyboardButton('Войти в аккаунт'),
         )
     bot.send_message(message.from_user.id, ('Добро пожаловать в FinBot\n'
@@ -823,22 +962,29 @@ def process_group_input(message):
             bot.send_message(message.from_user.id,
                              text='Группа не найдена, попробуй ввести снова')
         return
+
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['group_id'] = schedule_data[0]['id']
+        if state == 'UserStates:waiting_group':
+            data['group_id'] = schedule_data[0]['id']
+        else:
+            data['teacher_id'] = schedule_data[0]['id']
+
     markup = types.InlineKeyboardMarkup(row_width=2)
-    yes_btn = types.InlineKeyboardButton('Да, верно', callback_data="schedule_0")
     if state == 'UserStates:waiting_group':
+        yes_btn = types.InlineKeyboardButton('Да, верно', callback_data="schedule_group_0")
         no_btn = types.InlineKeyboardButton('Нет, выбрать заново', callback_data="group_incorrect")
         markup.add(yes_btn, no_btn)
         bot.send_message(message.from_user.id,
                          text=f'Твоя группа это {schedule_data[0]['label']}, верно?',
                          reply_markup=markup)
     elif state == 'UserStates:waiting_teacher':
+        yes_btn = types.InlineKeyboardButton('Да, верно', callback_data="schedule_teacher_0")
         no_btn = types.InlineKeyboardButton('Нет, выбрать заново', callback_data="teacher_incorrect")
         markup.add(yes_btn, no_btn)
         bot.send_message(message.from_user.id,
                          text=f'Ты хочешь посмотреть расписание {schedule_data[0]['label']}, верно?',
                          reply_markup=markup)
+    bot.set_state(message.from_user.id, UserStates.final, message.chat.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "group_incorrect")
@@ -857,18 +1003,49 @@ def handle_group_incorrect(call):
     bot.set_state(call.from_user.id, UserStates.waiting_teacher, call.message.chat.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('schedule_'))
-def handle_schedule_navigation(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith('schedule_group'))
+def handle_schedule_group_navigation(call):
     try:
         offset_str = call.data.split('_')[-1]
         offset = int(offset_str)
         bot.answer_callback_query(call.id, "Загрузка...")
-        show_schedule(
+        state = bot.get_state(call.from_user.id, call.message.chat.id)
+        if state == 'UserStates:waiting_teacher':
+            show_teacher_schedule(
+                bot,
+                call.message.chat.id,
+                offset,
+                call.message.message_id
+            )
+        else:
+            show_group_schedule(
+                bot,
+                call.message.chat.id,
+                offset,
+                call.message.message_id
+            )
+
+    except Exception as e:
+        bot.answer_callback_query(
+            call.id,
+            f"Ошибка: {str(e)}",
+            show_alert=True
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('schedule_teacher'))
+def handle_schedule_teacher_navigation(call):
+    try:
+        offset_str = call.data.split('_')[-1]
+        offset = int(offset_str)
+        bot.answer_callback_query(call.id, "Загрузка...")
+        show_teacher_schedule(
             bot,
             call.message.chat.id,
             offset,
             call.message.message_id
         )
+        bot.set_state(call.from_user.id, UserStates.final, call.message.chat.id)
 
     except Exception as e:
         bot.answer_callback_query(
